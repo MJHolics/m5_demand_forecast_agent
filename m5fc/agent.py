@@ -9,7 +9,8 @@ from __future__ import annotations
 import re
 from typing import Callable, TypedDict
 
-from .agent_tools import find_series, get_context, get_forecast, get_recent_trend
+from .agent_tools import find_series, get_context, get_forecast, get_recent_trend, summarize_forecast
+from .narration_guard import validate
 
 STATE_KEYWORDS = {
     "CA": ["ca", "california", "캘리포니아"],
@@ -86,6 +87,7 @@ class AgentState(TypedDict, total=False):
     recent_trend: dict[str, float]
     context: dict
     answer: str
+    guard_reasons: list[str]
 
 
 def node_parse(state: AgentState) -> AgentState:
@@ -127,7 +129,8 @@ def _fallback_synthesize(state: AgentState) -> str:
     )
 
 
-def make_node_synthesize(llm_complete: Callable[[str, str], str] | None = None) -> Callable[[AgentState], AgentState]:
+def make_node_synthesize(llm_complete: Callable[[str, str], str] | None = None,
+                         prompt_version: str = "v1") -> Callable[[AgentState], AgentState]:
     """llm_complete(system, user) -> str 형태의 콜러블을 주면 LLM으로 서술하고,
     안 주면(키 없는 환경 등) 결정론적 템플릿으로 대체한다."""
     def node_synthesize(state: AgentState) -> AgentState:
@@ -135,6 +138,18 @@ def make_node_synthesize(llm_complete: Callable[[str, str], str] | None = None) 
             return {"answer": _fallback_synthesize(state)}
         if not state["series_ids"]:
             return {"answer": _fallback_synthesize(state)}
+        if prompt_version == "v3":
+            # v2 프롬프트 + 검증 게이트: 표로 설명 안 되는 숫자·방향 모순·외국 문자가 있으면
+            # LLM 답을 버리고 결정론적 템플릿으로 물러난다(틀린 답보다 덜 친절한 답이 낫다).
+            system, user = _prompt_v2(state)
+            draft = llm_complete(system, user)
+            ok, reasons = validate(draft, state)
+            if ok:
+                return {"answer": draft, "guard_reasons": []}
+            return {"answer": _fallback_synthesize(state), "guard_reasons": reasons}
+        if prompt_version != "v1":
+            system, user = PROMPTS[prompt_version](state)
+            return {"answer": llm_complete(system, user)}
         system = (
             "너는 소매 수요예측 결과를 설명하는 어시스턴트다. 아래 도구 결과에 있는 숫자만 근거로 "
             "답하고, 도구 결과에 없는 숫자는 절대 지어내지 마라."
@@ -152,14 +167,65 @@ def make_node_synthesize(llm_complete: Callable[[str, str], str] | None = None) 
     return node_synthesize
 
 
-def build_graph(artifact: dict, llm_complete: Callable[[str, str], str] | None = None):
+_WEEKDAYS = "월화수목금토일"
+
+
+def _fmt(x: float) -> str:
+    return f"{x:,.0f}" if float(x).is_integer() else f"{x:,.1f}"
+
+
+def _prompt_v2(state: AgentState) -> tuple[str, str]:
+    """집계는 도구가 미리 내고, LLM에는 요약표만 준다(일별 원시값 28+28개 대신 첫 주 요일 패턴 7개).
+    v1 dev에서 본 실패(직접 합산 오류·변화율 바꿔치기·나열하다 잘림)를 입력에서 없앤다."""
+    from datetime import date
+
+    s = summarize_forecast(state["forecast"], state["recent_trend"])
+    ctx = state["context"]
+    first_week = sorted(state["forecast"])[:7]
+    pattern = ", ".join(
+        f"{_WEEKDAYS[date.fromisoformat(d).weekday()]}({d[5:]}) {_fmt(state['forecast'][d])}" for d in first_week
+    )
+    ch = s["change_vs_recent"]
+    change = (f"최근 28일 대비 {ch['direction']} {ch['pct']:.1f}% (차이 {_fmt(ch['abs_diff'])}개)"
+              if ch else "최근 실적 없음")
+    events = ", ".join(f"{e['date']} {e['event_name_1']}" for e in ctx["events_in_forecast_window"]) or "없음"
+    snap = "; ".join(f"{st} {len(days)}일({', '.join(d[5:] for d in days)})"
+                     for st, days in ctx["snap_days_by_state"].items())
+    system = (
+        "너는 소매 수요예측 결과를 설명하는 어시스턴트다. 한국어로만 3~5문장으로 답한다.\n"
+        "규칙: 숫자는 아래 [요약표]에 적힌 값을 그대로 옮겨 쓴다. 더하기·나누기·변화율 같은 계산을 직접 하지 마라 — "
+        "필요한 계산은 이미 표에 있다. 표에 없는 숫자가 필요한 질문이면 '제공된 결과에 없다'고 답한다. "
+        "일별 값을 나열하지 말고 질문에 필요한 값만 쓴다."
+    )
+    user = (
+        f"질문: {state['query']}\n\n[요약표]\n"
+        f"- 예측 모델: {ctx['model']} (최근 1주 패턴을 4주 반복), 매칭 시리즈 {ctx['series_count']}개\n"
+        f"- 예측 기간: {min(state['forecast'])} ~ {max(state['forecast'])} (28일)\n"
+        f"- 4주 예측 합계: {_fmt(s['forecast_total_28d'])}개 · 하루 평균 {_fmt(s['forecast_daily_avg'])}개\n"
+        f"- 주별 예측 합계: {' / '.join(_fmt(w) for w in s['forecast_weekly_totals'])}\n"
+        f"- 최근 28일 실적 합계: {_fmt(s['recent_total_28d'])}개 → {change}\n"
+        f"- 요일별 예측(첫 주): {pattern}\n"
+        f"- 예측 최대: {_fmt(s['peak_value'])}개 ({', '.join(s['peak_days'])})\n"
+        f"- 예측 최소: {_fmt(s['low_value'])}개 ({', '.join(s['low_days'])})\n"
+        f"- 평균 현재가: {ctx['avg_current_price']:.2f}달러\n"
+        f"- 예측 기간 이벤트: {events}\n"
+        f"- SNAP일: {snap}\n"
+    )
+    return system, user
+
+
+PROMPTS: dict[str, Callable[[AgentState], tuple[str, str]]] = {"v2": _prompt_v2}
+
+
+def build_graph(artifact: dict, llm_complete: Callable[[str, str], str] | None = None,
+                prompt_version: str = "v1"):
     from langgraph.graph import END, StateGraph
 
     graph = StateGraph(AgentState)
     graph.add_node("parse", node_parse)
     graph.add_node("lookup", make_node_lookup(artifact))
     graph.add_node("tools", make_node_tools(artifact))
-    graph.add_node("synthesize", make_node_synthesize(llm_complete))
+    graph.add_node("synthesize", make_node_synthesize(llm_complete, prompt_version))
 
     graph.set_entry_point("parse")
     graph.add_edge("parse", "lookup")

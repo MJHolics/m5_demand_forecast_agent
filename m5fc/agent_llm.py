@@ -13,6 +13,8 @@ def _detect_provider() -> str:
     provider = os.getenv("LLM_PROVIDER", "auto").lower()
     if provider != "auto":
         return provider
+    if os.getenv("LOCAL_LLM_BASE_URL"):
+        return "local"
     if os.getenv("GEMINI_API_KEY") or os.getenv("GOOGLE_API_KEY"):
         return "gemini"
     if os.getenv("ANTHROPIC_API_KEY"):
@@ -29,6 +31,7 @@ DEFAULT_MODELS = {
     "gemini": os.getenv("GEMINI_MODEL", "gemini-2.5-flash"),
     "anthropic": os.getenv("ANTHROPIC_MODEL", "claude-sonnet-4-6"),
     "openai": os.getenv("OPENAI_MODEL", "gpt-4o-mini"),
+    "local": os.getenv("LOCAL_LLM_MODEL", "Qwen/Qwen2.5-7B-Instruct-AWQ"),
 }
 
 
@@ -39,7 +42,8 @@ class LLM:
         self._client = None
 
     def complete(self, system: str, user: str, temperature: float = 0.0) -> str:
-        fn = {"gemini": self._gemini, "anthropic": self._anthropic, "openai": self._openai}[self.provider]
+        fn = {"gemini": self._gemini, "anthropic": self._anthropic, "openai": self._openai,
+              "local": self._local}[self.provider]
         return fn(system, user, temperature)
 
     def _gemini(self, system: str, user: str, temperature: float) -> str:
@@ -72,6 +76,18 @@ class LLM:
             model=self.model, temperature=temperature,
             messages=[{"role": "system", "content": system}, {"role": "user", "content": user}],
         )
+        return (resp.choices[0].message.content or "").strip()
+
+    def _local(self, system: str, user: str, temperature: float) -> str:
+        """온프레미스 OpenAI 호환 서버(vLLM 등). 키 불요 — Inspection Copilot `_local`과 같은 형태."""
+        if self._client is None:
+            from openai import OpenAI
+            self._client = OpenAI(base_url=os.getenv("LOCAL_LLM_BASE_URL"), api_key="EMPTY", timeout=120)
+        resp = self._client.chat.completions.create(
+            model=self.model, temperature=temperature, max_tokens=512,
+            messages=[{"role": "system", "content": system}, {"role": "user", "content": user}],
+        )
+        self.last_finish_reason = resp.choices[0].finish_reason  # "length"면 출력 한도에서 잘린 답
         return (resp.choices[0].message.content or "").strip()
 
 
